@@ -8,3 +8,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.71"
 artnet_protocol = "0.4.1"
+log = "0.4.18"
+midir = "0.9.1"
+number = { git = "https://github.com/generalelectrix/number", branch = "main" }
+simplelog = "0.12.1"
