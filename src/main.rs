@@ -6,15 +6,13 @@ use number::UnipolarFloat;
 use serde::Deserialize;
 use simplelog::{Config as LogConfig, SimpleLogger};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap},
     env::args,
     fs::File,
-    io,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs, UdpSocket},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
     path::Path,
     sync::mpsc::{channel, Sender},
     thread,
-    time::{Duration, Instant},
 };
 
 const PORT: u16 = 6454;
