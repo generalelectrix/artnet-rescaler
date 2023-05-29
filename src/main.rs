@@ -6,7 +6,7 @@ use number::UnipolarFloat;
 use serde::Deserialize;
 use simplelog::{Config as LogConfig, SimpleLogger};
 use std::{
-    collections::{HashMap},
+    collections::HashMap,
     env::args,
     fs::File,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
@@ -18,12 +18,12 @@ use std::{
 const PORT: u16 = 6454;
 
 fn main() -> Result<()> {
-    let config_path = args().next().unwrap();
+    let config_path = args().nth(1).unwrap();
     let config_file = File::open(Path::new(&config_path))?;
-    let config: Config = serde_yaml::from_reader(&config_file)?;
+    let config: Config = serde_yaml::from_reader(&config_file).unwrap();
 
     SimpleLogger::init(log::LevelFilter::Info, LogConfig::default())?;
-    let socket = UdpSocket::bind(("0.0.0.0", PORT))?;
+    let socket = UdpSocket::bind(("0.0.0.0", PORT)).unwrap();
     run_rescale(socket, config)
 }
 
