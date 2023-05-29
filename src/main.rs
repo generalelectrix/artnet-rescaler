@@ -1,88 +1,35 @@
 use anyhow::{anyhow, bail, Result};
 use artnet_protocol::*;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use midir::{MidiIO, MidiInput, MidiInputConnection};
 use number::UnipolarFloat;
+use serde::Deserialize;
 use simplelog::{Config as LogConfig, SimpleLogger};
 use std::{
+    collections::{HashMap, HashSet},
     env::args,
+    fs::File,
     io,
-    net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs, UdpSocket},
+    path::Path,
     sync::mpsc::{channel, Sender},
     thread,
     time::{Duration, Instant},
 };
 
-const POLL_TIME: Duration = Duration::from_secs(5);
 const PORT: u16 = 6454;
 
 fn main() -> Result<()> {
+    let config_path = args().next().unwrap();
+    let config_file = File::open(Path::new(&config_path))?;
+    let config: Config = serde_yaml::from_reader(&config_file)?;
+
     SimpleLogger::init(log::LevelFilter::Info, LogConfig::default())?;
-    match args().nth(1).unwrap().as_str() {
-        "poll" => {
-            let socket = UdpSocket::bind(("0.0.0.0", PORT)).unwrap();
-            let broadcast_addr = ("255.255.255.255", PORT).to_socket_addrs()?.next().unwrap();
-            socket.set_broadcast(true).unwrap();
-            let buff = ArtCommand::Poll(Poll::default()).write_to_buffer()?;
-            socket.send_to(&buff, broadcast_addr).unwrap();
-
-            println!("Polling for devices...");
-            let start = Instant::now();
-            socket.set_read_timeout(Some(Duration::from_secs(1)))?;
-            loop {
-                if start.elapsed() > POLL_TIME {
-                    return Ok(());
-                }
-
-                let mut buffer = [0u8; 1024];
-                let (length, _addr) = match socket.recv_from(&mut buffer) {
-                    Err(err) => {
-                        if err.kind() == io::ErrorKind::WouldBlock {
-                            continue;
-                        }
-                        bail!(err);
-                    }
-                    Ok(md) => md,
-                };
-                let command = ArtCommand::from_buffer(&buffer[..length])?;
-
-                if let ArtCommand::PollReply(reply) = command {
-                    println!(
-                        "Device found at {}: {}",
-                        reply.address,
-                        String::from_utf8_lossy(&reply.short_name),
-                    );
-                }
-            }
-        }
-        "node" => loop {
-            let socket = UdpSocket::bind(("192.168.1.127", PORT)).unwrap();
-            let mut buffer = [0u8; 1024];
-            let (length, addr) = socket.recv_from(&mut buffer)?;
-            let command = ArtCommand::from_buffer(&buffer[..length])?;
-
-            if let ArtCommand::Poll(_) = command {
-                let poll_resp = poll_response().unwrap();
-                socket.send_to(&poll_resp, addr).unwrap();
-            }
-        },
-        "rescale" => {
-            let socket = UdpSocket::bind(("0.0.0.0", PORT)).unwrap();
-            let target = ("10.10.0.4", PORT)
-                .to_socket_addrs()
-                .unwrap()
-                .next()
-                .unwrap();
-            run_rescale(socket, &[target])?;
-            Ok(())
-        }
-        other => {
-            panic!("unknown mode {other}");
-        }
-    }
+    let socket = UdpSocket::bind(("0.0.0.0", PORT))?;
+    run_rescale(socket, config)
 }
 
-fn run_rescale(socket: UdpSocket, destinations: &[SocketAddr]) -> Result<()> {
+fn run_rescale(socket: UdpSocket, config: Config) -> Result<()> {
     let (send, recv) = channel::<Action>();
 
     let mut scale = UnipolarFloat::ONE;
@@ -102,7 +49,9 @@ fn run_rescale(socket: UdpSocket, destinations: &[SocketAddr]) -> Result<()> {
         }
     });
 
-    let _input = Input::new("MC-8".to_string(), send)?;
+    let _input = Input::new(config.midi_port.clone(), send)?;
+
+    let actions = config.actions();
 
     loop {
         let action = recv.recv().unwrap();
@@ -123,8 +72,15 @@ fn run_rescale(socket: UdpSocket, destinations: &[SocketAddr]) -> Result<()> {
                 scale = val;
             }
             Action::Packet(mut output) => {
-                for val in output.data.as_mut() {
-                    *val = ((*val as f64) * scale.val()) as u8;
+                let Some(action) = actions.get(&output.port_address) else {
+                    debug!("Ignoring non-configured universe {:?}", output.port_address);
+                    continue;
+                };
+                if action.rescale {
+                    rescale_universe(scale, &mut output);
+                }
+                if !action.remap.is_empty() {
+                    remap_universe(&action.remap, &mut output);
                 }
                 let command = ArtCommand::Output(output);
                 let buffer = match command.write_to_buffer() {
@@ -134,14 +90,32 @@ fn run_rescale(socket: UdpSocket, destinations: &[SocketAddr]) -> Result<()> {
                         continue;
                     }
                 };
-                for dest in destinations {
-                    if let Err(err) = socket.send_to(&buffer, dest) {
-                        error!("artnet send error: {err}");
-                    }
+                let dest = SocketAddrV4::new(action.destination, PORT);
+                if let Err(err) = socket.send_to(&buffer, dest) {
+                    error!("artnet send error: {err}");
                 }
             }
         }
     }
+}
+
+fn rescale_universe(scale: UnipolarFloat, output: &mut Output) {
+    for val in output.data.as_mut() {
+        *val = ((*val as f64) * scale.val()) as u8;
+    }
+}
+
+fn remap_universe(remappings: &[Remapping], output: &mut Output) {
+    let mut buffer = vec![0u8; 512];
+    let input = output.data.as_ref();
+    for remap in remappings {
+        let Some(vals) = input.get(remap.start..remap.start+remap.length) else {
+            warn!("remapping out of range for {:?} (input length {}): {:?}", output.port_address, input.len(), remap);
+            continue;
+        };
+        buffer[remap.new_start..remap.new_start + remap.length].copy_from_slice(vals);
+    }
+    output.data = buffer.into()
 }
 
 pub enum Action {
@@ -265,4 +239,35 @@ fn poll_response() -> Result<Vec<u8>> {
         filler: Default::default(),
     }));
     Ok(resp.write_to_buffer()?)
+}
+
+#[derive(Deserialize)]
+pub struct Config {
+    midi_port: String,
+    universes: HashMap<u8, UniverseActions>,
+}
+
+impl Config {
+    fn actions(&self) -> HashMap<PortAddress, UniverseActions> {
+        self.universes
+            .iter()
+            .map(|(id, actions)| ((*id).into(), actions.clone()))
+            .collect()
+    }
+}
+
+#[derive(Deserialize, Clone)]
+pub struct UniverseActions {
+    #[serde(default)]
+    rescale: bool,
+    #[serde(default)]
+    remap: Vec<Remapping>,
+    destination: Ipv4Addr,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct Remapping {
+    start: usize,
+    length: usize,
+    new_start: usize,
 }

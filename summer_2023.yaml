@@ -1,0 +1,23 @@
+midi_port: "test"
+universes:
+  0:
+    rescale: true
+    destination: "10.10.0.4"
+  1:
+    rescale: true
+    destination: "10.10.0.4"
+  2:
+    rescale: true
+    destination: "10.10.0.4"
+  3:
+    rescale: true
+    destination: "10.10.0.4"
+  4:
+    destination: "10.10.0.8"
+    remap:
+      - start: 0
+        length: 3
+        new_start: 20
+      - start: 3
+        length: 3
+        new_start: 24
