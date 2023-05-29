@@ -1,4 +1,14 @@
 midi_port: "test"
+rescale_midi_control:
+  channel: 0
+  control: 0
+osc_forward:
+  destination: "1.2.3.4:5678"
+  mappings:
+    - midi:
+        channel: 0
+        control: 1
+      osc: "/foo/bar"
 universes:
   0:
     rescale: true

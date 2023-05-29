@@ -3,6 +3,7 @@ use artnet_protocol::*;
 use log::{debug, error, info, warn};
 use midir::{MidiIO, MidiInput, MidiInputConnection};
 use number::UnipolarFloat;
+use rosc::{encoder, OscMessage, OscPacket, OscType};
 use serde::Deserialize;
 use simplelog::{Config as LogConfig, SimpleLogger};
 use std::{
@@ -47,7 +48,14 @@ fn run_rescale(socket: UdpSocket, config: Config) -> Result<()> {
         }
     });
 
-    let input = Input::new(config.midi_port.clone(), send);
+    let send_osc = forward_osc(&config)?;
+
+    let input = Input::new(
+        config.midi_port.clone(),
+        config.rescale_midi_control,
+        send,
+        send_osc,
+    );
     if let Err(err) = &input {
         error!("failed to open midi port: {err}");
     }
@@ -144,7 +152,12 @@ pub struct Input {
 }
 
 impl Input {
-    pub fn new(name: String, sender: Sender<Action>) -> Result<Self> {
+    pub fn new(
+        name: String,
+        rescale_control: MidiControl,
+        sender: Sender<Action>,
+        osc_forward: Sender<(MidiControl, u8)>,
+    ) -> Result<Self> {
         let input = MidiInput::new("tunnels")?;
         let port = get_named_port(&input, &name)?;
         let handler_name = name.clone();
@@ -169,13 +182,18 @@ impl Input {
                     if event_type != EventType::ControlChange {
                         return;
                     }
-                    let channel = msg[0] & 15;
-                    if channel != 0 {
+                    let control = MidiControl {
+                        channel: msg[0] & 15,
+                        control: msg[1],
+                    };
+                    let val = msg[2];
+                    // If this message matches scaler config, use it.
+                    if control == rescale_control {
+                        sender.send(Action::Scale(unipolar_from_midi(val))).unwrap();
                         return;
                     }
-                    sender
-                        .send(Action::Scale(unipolar_from_midi(msg[2])))
-                        .unwrap();
+                    // Otherwise, pass the message on for OSC forwarding.
+                    osc_forward.send((control, val)).unwrap();
                 },
                 (),
             )
@@ -245,6 +263,8 @@ fn poll_response() -> Result<Vec<u8>> {
 #[derive(Deserialize)]
 pub struct Config {
     midi_port: String,
+    rescale_midi_control: MidiControl,
+    osc_forward: OscForward,
     universes: HashMap<u8, UniverseActions>,
 }
 
@@ -271,4 +291,63 @@ pub struct Remapping {
     start: usize,
     length: usize,
     new_start: usize,
+}
+
+#[derive(Deserialize, PartialEq, Eq, Debug, Clone, Copy, Hash)]
+pub struct MidiControl {
+    channel: u8,
+    control: u8,
+}
+
+#[derive(Deserialize, PartialEq, Eq, Debug, Clone)]
+pub struct OscMapping {
+    midi: MidiControl,
+    osc: String,
+}
+
+#[derive(Deserialize, PartialEq, Eq, Debug, Clone)]
+pub struct OscForward {
+    destination: SocketAddr,
+    mappings: Vec<OscMapping>,
+}
+
+fn forward_osc(config: &Config) -> Result<Sender<(MidiControl, u8)>> {
+    let (send, recv) = channel();
+
+    let dest = config.osc_forward.destination;
+    let mapping: HashMap<_, _> = config
+        .osc_forward
+        .mappings
+        .iter()
+        .map(|mapping| (mapping.midi, mapping.osc.clone()))
+        .collect();
+
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+
+    thread::spawn(move || loop {
+        let (midi_control, val) = recv.recv().unwrap();
+        let Some(osc_control) = mapping.get(&midi_control) else {
+                warn!("ignoring unmapped midi mapping {:?}", midi_control);
+                continue;
+            };
+        let payload = unipolar_from_midi(val);
+        let osc_msg = OscMessage {
+            addr: osc_control.clone(),
+            args: vec![OscType::Double(payload.val())],
+        };
+
+        let packet = OscPacket::Message(osc_msg);
+        let msg_buf = match encoder::encode(&packet) {
+            Ok(buf) => buf,
+            Err(err) => {
+                error!("Error encoding OSC packet {packet:?}: {err}.");
+                continue;
+            }
+        };
+        if let Err(err) = socket.send_to(&msg_buf, dest) {
+            error!("OSC send error to address {dest}: {}.", err);
+        }
+    });
+
+    Ok(send)
 }
