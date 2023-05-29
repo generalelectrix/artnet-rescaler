@@ -49,7 +49,10 @@ fn run_rescale(socket: UdpSocket, config: Config) -> Result<()> {
         }
     });
 
-    let _input = Input::new(config.midi_port.clone(), send)?;
+    let input = Input::new(config.midi_port.clone(), send);
+    if let Err(err) = &input {
+        error!("failed to open midi port: {err}");
+    }
 
     let actions = config.actions();
 
